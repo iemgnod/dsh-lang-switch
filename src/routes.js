@@ -1,0 +1,139 @@
+/**
+ * HTTP bridge for the settings page.
+ *
+ * The operation lives here once and is called by both the page (through this
+ * route) and the agent (`lang_switch` tool), so the two callers cannot drift.
+ */
+
+import { LANGUAGES } from './languages.js';
+
+const PREFIX = '/dsh-lang';
+const MAX_BODY_BYTES = 64 * 1024;
+
+/**
+ * @param {import('node:http').ServerResponse} response
+ * @param {number} status
+ * @param {unknown} payload
+ */
+function sendJson(response, status, payload) {
+  if (response.writableEnded) return;
+  const body = JSON.stringify(payload);
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
+/** @param {import('node:http').IncomingMessage} request */
+async function readJson(request) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) throw new Error('请求体过大');
+    chunks.push(chunk);
+  }
+  if (chunks.length === 0) return {};
+  const text = Buffer.concat(chunks).toString('utf8').trim();
+  if (text === '') return {};
+  return JSON.parse(text);
+}
+
+/** @param {string} host */
+function loopbackAuthority(host) {
+  const name = host.split(':')[0]?.toLowerCase() ?? '';
+  return name === 'localhost' || name === '127.0.0.1' || name === '[::1]' || name === '::1';
+}
+
+/**
+ * @param {import('node:http').IncomingMessage} request
+ * @param {string[]} trustedHosts
+ */
+function sameOrigin(request, trustedHosts) {
+  const origin = request.headers.origin;
+  if (typeof origin !== 'string' || origin === '') return true;
+  let host;
+  try {
+    host = new URL(origin).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  return loopbackAuthority(host) || trustedHosts.includes(host);
+}
+
+/**
+ * @param {import('node:http').IncomingMessage} request
+ * @param {{ requestRejection?: (request: import('node:http').IncomingMessage) => string | undefined }} gate
+ */
+function rejection(request, gate) {
+  try {
+    return gate.requestRejection?.(request);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {{ store: import('./store.js').LangStore }} deps
+ */
+export function registerLangRoutes(ctx, deps) {
+  const { store } = deps;
+  let gate = {};
+  try {
+    gate = ctx.get('connection') ?? {};
+  } catch {
+    gate = {};
+  }
+  const trustedHosts = Array.isArray(gate?.trustedHosts) ? gate.trustedHosts : [];
+
+  const handler = async (request, response) => {
+    try {
+      const denied = rejection(request, gate);
+      if (denied !== undefined) return sendJson(response, 403, { error: 'host-rejected', detail: denied });
+      if (!sameOrigin(request, trustedHosts)) return sendJson(response, 403, { error: 'untrusted-origin' });
+
+      const url = new URL(request.url ?? '/', 'http://localhost');
+      const route = url.pathname.slice(PREFIX.length) || '/';
+      const method = request.method ?? 'GET';
+
+      if (method === 'GET' && route === '/state') {
+        return sendJson(response, 200, {
+          state: store.read(),
+          languages: LANGUAGES,
+        });
+      }
+
+      if (method === 'POST' && route === '/state') {
+        let body;
+        try {
+          body = await readJson(request);
+        } catch (error) {
+          return sendJson(response, 400, { error: 'bad-request', detail: String(error) });
+        }
+        const patch = {};
+        for (const key of ['mode', 'thinking', 'response', 'enforce']) {
+          if (key in body) patch[key] = body[key];
+        }
+        try {
+          return sendJson(response, 200, { state: store.write(patch), languages: LANGUAGES });
+        } catch (error) {
+          return sendJson(response, 500, { error: 'write-failed', detail: String(error) });
+        }
+      }
+
+      return sendJson(response, 404, { error: 'not-found' });
+    } catch (error) {
+      return sendJson(response, 500, { error: 'internal', detail: String(error) });
+    }
+  };
+
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }),
+    'dsh-lang-switch: settings routes',
+  );
+}
+
+export { PREFIX };
